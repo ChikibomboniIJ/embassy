@@ -19,6 +19,7 @@ use crate::gpio::{AfType, AnyPin, OutputType, Pull, SealedPin as _, Speed};
 use crate::interrupt::typelevel::Interrupt as _;
 use crate::interrupt::{self, Interrupt, InterruptExt};
 use crate::mode::{Async, Blocking, Mode};
+use crate::pac::UART5;
 #[cfg(not(any(usart_v1, usart_v2)))]
 use crate::pac::usart::Lpuart as Regs;
 #[cfg(any(usart_v1, usart_v2))]
@@ -26,7 +27,6 @@ use crate::pac::usart::Usart as Regs;
 use crate::pac::usart::{regs, vals};
 use crate::rcc::{RccInfo, SealedRccPeripheral};
 use crate::time::Hertz;
-
 /// Interrupt handler.
 pub struct InterruptHandler<T: Instance> {
     _phantom: PhantomData<T>,
@@ -74,6 +74,10 @@ unsafe fn on_interrupt(r: Regs, s: &'static State) {
         // We cannot check the RXNE flag as it is auto-cleared by the DMA controller
 
         // It is up to the listener to determine if this in fact was a RX event and disable the RXNE detection
+    } else if cr1.rtoie() && sr.rtof() {
+        r.cr1().modify(|w| {
+            w.set_rtoie(false);
+        });
     } else {
         return;
     }
@@ -744,6 +748,169 @@ impl<'d> UartRx<'d, Async> {
         self.inner_read(buffer, true).await
     }
 
+    /// Initiate an asynchronous read with rto line detection enabled
+    pub async fn read_until_rto(&mut self, buffer: &mut [u8]) -> Result<usize, Error> {
+        let _scoped_block_stop = self.info.rcc.block_stop();
+        self.inner_read_rto(buffer).await
+    }
+
+    async fn inner_read_with_rto_run(&mut self, buffer: &mut [u8]) -> Result<ReadCompletionEvent, Error> {
+        let r = self.info.regs;
+        const RTO: u32 = 35;
+
+        // // make sure USART state is restored to neutral state when this future is dropped
+        let on_drop = OnDrop::new(move || {
+            // clear all interrupts and DMA Rx Request
+            r.cr1().modify(|w| {
+                // disable RXNE interrupt
+                w.set_rxneie(false);
+                // disable parity interrupt
+                w.set_peie(false);
+                // disable idle line interrupt
+                w.set_idleie(false);
+
+                w.set_rtoie(false);
+            });
+            r.cr3().modify(|w| {
+                // disable Error Interrupt: (Frame error, Noise error, Overrun error)
+                w.set_eie(false);
+                // disable DMA Rx Request
+                w.set_dmar(false);
+            });
+        });
+
+        let ch = self.rx_dma.as_mut().unwrap();
+
+        let buffer_len = buffer.len();
+
+        // Start USART DMA
+        // will not do anything yet because DMAR is not yet set
+        // future which will complete when DMA Read request completes
+        let transfer = unsafe { ch.read(rdr(r), buffer, Default::default()) };
+
+        // clear ORE flag just before enabling DMA Rx Request: can be mandatory for the second transfer
+        if !self.detect_previous_overrun {
+            let sr = sr(r).read();
+            // This read also clears the error and idle interrupt flags on v1.
+            unsafe { rdr(r).read_volatile() };
+            clear_interrupt_flags(r, sr);
+        }
+
+        r.cr1().modify(|w| {
+            // disable RXNE interrupt
+            w.set_rxneie(false);
+            // enable parity interrupt if not ParityNone
+            w.set_peie(w.pce());
+        });
+
+        r.cr3().modify(|w| {
+            // enable Error Interrupt: (Frame error, Noise error, Overrun error)
+            w.set_eie(true);
+            // enable DMA Rx Request
+            w.set_dmar(true);
+        });
+
+        UART5.rtor().write(|w| w.set_rto(RTO));
+
+        compiler_fence(Ordering::SeqCst);
+
+        // In case of errors already pending when reception started, interrupts may have already been raised
+        // and lead to reception abortion (Overrun error for instance). In such a case, all interrupts
+        // have been disabled in interrupt handler and DMA Rx Request has been disabled.
+
+        let cr3 = r.cr3().read();
+
+        if !cr3.dmar() {
+            // something went wrong
+            // because the only way to get this flag cleared is to have an interrupt
+
+            // DMA will be stopped when transfer is dropped
+
+            let sr = sr(r).read();
+            // This read also clears the error and idle interrupt flags on v1.
+            unsafe { rdr(r).read_volatile() };
+            clear_interrupt_flags(r, sr);
+
+            if sr.pe() {
+                return Err(Error::Parity);
+            }
+            if sr.fe() {
+                return Err(Error::Framing);
+            }
+            if sr.ne() {
+                return Err(Error::Noise);
+            }
+            if sr.ore() {
+                return Err(Error::Overrun);
+            }
+
+            unreachable!();
+        }
+
+        {
+            // clear idle flag
+            let sr = sr(r).read();
+            // This read also clears the error and idle interrupt flags on v1.
+            unsafe { rdr(r).read_volatile() };
+            clear_interrupt_flags(r, sr);
+
+            // enable idle interrupt
+            r.cr1().modify(|w| {
+                w.set_rtoie(true);
+            });
+
+            r.cr2().modify(|w| w.set_rtoen(true));
+        }
+
+        compiler_fence(Ordering::SeqCst);
+        // future which completes when idle line or error is detected
+        let s = self.state;
+        let abort = poll_fn(move |cx| {
+            s.rx_waker.register(cx.waker());
+
+            let isr = r.isr().read();
+
+            if isr.pe() {
+                return Poll::Ready(Err(Error::Parity));
+            }
+            if isr.fe() {
+                return Poll::Ready(Err(Error::Framing));
+            }
+            if isr.ne() {
+                return Poll::Ready(Err(Error::Noise));
+            }
+            if isr.ore() {
+                return Poll::Ready(Err(Error::Overrun));
+            }
+
+            if isr.rtof() {
+                return Poll::Ready(Ok(()));
+            }
+
+            Poll::Pending
+        });
+
+        // wait for the first of DMA request or idle line detected to completes
+        // select consumes its arguments
+        // when transfer is dropped, it will stop the DMA request
+        let r = match select(transfer, abort).await {
+            // DMA transfer completed first
+            Either::Left(((), _)) => Ok(ReadCompletionEvent::DmaCompleted),
+
+            // Idle line detected first
+            Either::Right((Ok(()), transfer)) => Ok(ReadCompletionEvent::Idle(
+                buffer_len - transfer.get_remaining_transfers() as usize,
+            )),
+
+            // error occurred
+            Either::Right((Err(e), _)) => Err(e),
+        };
+
+        drop(on_drop);
+
+        r
+    }
+
     async fn inner_read_run(
         &mut self,
         buffer: &mut [u8],
@@ -929,6 +1096,25 @@ impl<'d> UartRx<'d, Async> {
         drop(on_drop);
 
         r
+    }
+
+    async fn inner_read_rto(&mut self, buffer: &mut [u8]) -> Result<usize, Error> {
+        if buffer.is_empty() {
+            return Ok(0);
+        } else if buffer.len() > 0xFFFF {
+            return Err(Error::BufferTooLong);
+        }
+
+        let buffer_len = buffer.len();
+
+        // wait for DMA to complete or IDLE line detection if requested
+        let res = self.inner_read_with_rto_run(buffer).await;
+
+        match res {
+            Ok(ReadCompletionEvent::DmaCompleted) => Ok(buffer_len),
+            Ok(ReadCompletionEvent::Idle(n)) => Ok(n),
+            Err(e) => Err(e),
+        }
     }
 
     async fn inner_read(&mut self, buffer: &mut [u8], enable_idle_line_detection: bool) -> Result<usize, Error> {
@@ -1323,6 +1509,11 @@ impl<'d> Uart<'d, Async> {
     /// Perform an an asynchronous read with idle line detection enabled
     pub async fn read_until_idle(&mut self, buffer: &mut [u8]) -> Result<usize, Error> {
         self.rx.read_until_idle(buffer).await
+    }
+
+     /// Perform an an asynchronous read with rto detection enabled
+    pub async fn read_until_rto(&mut self, buffer: &mut [u8]) -> Result<usize, Error> {
+        self.rx.read_until_rto(buffer).await
     }
 }
 
